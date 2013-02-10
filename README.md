@@ -136,3 +136,82 @@ net
 	Architecture: OpenBSD.i386
 	Machine     : i386
 ```
+
+## First Reported
+
+To: tech ( at ) openbsd ( dot ) org  
+Subject: Per Route Metrics and TCP Window Size  
+From: "Pete Kazmier" <pete ( at ) kazmier ( dot ) com>  
+Date: Sun, 2 Jul 2000 19:24:54 -0400  
+
+Hello,
+
+I have a few questions regarding the per route metrics stored in the
+routing table such as the 'recvpipe' metric.  This is of great
+interest to me because I want to significantly increase the TCP window
+size that I advertise when routing to a particular route.
+
+I think this is a much more elegant solution than: 1) changing my
+system's global recvbuf via sysctl -w net.inet.tcp.recvspace or 2)
+adding a call to setsockopt() changing my SO_RCVBUF for the app in
+question.
+
+With that said, I've added a static route to my routing table:
+
+route add -net 172.25.1.0 10.10.10.1 -recvpipe 146000
+
+All TCP connections going to the 172.25.1 network should now advertise
+a window size of 146000 (multiple of my 1460 mtu since the kernel
+rounds up to nearest mutliple).  
+
+As we all know, the window size is limited to a 16bit number, thus the
+tcp window scaling option.  So I would expect to see window scaling
+with a value of 2.  However, this does not occur, here is a tcpdump:
+
+```
+matrix > 172.25.1.25: S 1918507088:1918507088(0) 
+       win 16384 <mss 1460,nop,wscale 0,nop,nop,timestamp[|tcp]> [tos 0x10]
+
+172.25.1.25 > matrix: S 1491979679:1491979679(0) ack 1918507089 
+       win 30660 <mss 1460,nop,nop,timestamp 259364247[|tcp]> (DF)
+
+matrix > 172.25.1.25: . ack 1 
+       win 65535 <nop,nop,timestamp 2168339 259364247> [tos 0x10]
+```
+
+Matrix is my openbsd box.  As you can see, the window scaling option
+is set to 0, thus limiting my window advertisement to 65535.  
+
+Ok, so I did a little testing to verify that the -recvpipe option
+actually works.  I changed the window to something larger than the
+default (16384), but less than 65535.  Everything worked correctly.
+
+So I did a little poking around the tcp source code, and after a
+little examination, here's my theory on whats happening:
+
+When tcp_usrreq() is called (by the connect() system call), it
+calculates the window scale using so->so_rcv.sb_hiwat which at this
+point is currently set to the default buffer size of 16384 (or a value
+that could have been set by a call to setsockopt and SO_RCVBUF).  In
+my example, the window scale is calculated to be 0 because 16384 is
+less than 65535, thus tp->request_r_scale is set to 0.
+
+Then tcp_output() is eventually called to send the SYN packet, which
+in turns calls tcp_mss().  tcp_mss() checks to see if any per route
+'recvpipe' metrics exist.  If one does exist, the socket buffer is
+changed to the appropriate size via sbreserve.  In my example, the
+socket buffer is increased to 146000 via sbreserve.  Keep in mind, the
+window scale has not been adjusted even though we've changed the
+buffer of the receive socket.
+
+After tcp_output() calls tpc_mss(), it finally gets to the point where
+it appends the tcp window scale option to the packet itself, but it
+uses the value stored in tp->request_r_scale, which is still 0!
+Unfortunately, this value is incorrect because the size of the socket
+buffer was changed in tcp_mss() per the route metric.
+tp->request_r_scale should be 2, not 0, in my example.
+
+Does that any sense?
+
+Thanks,
+Pete
